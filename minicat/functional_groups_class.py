@@ -519,24 +519,99 @@ class AmmoniumFG(FGDef):
         return mol
 
     def anchor_center_and_vector(self, mol: Chem.Mol, match: Tuple[int, ...]) -> Tuple[np.ndarray, np.ndarray]:
+            coords = rdconf_to_numpy(mol)
+            N_idx = match[0]
+            Npos  = coords[N_idx]
+            N_atom = mol.GetAtomWithIdx(N_idx)
+            
+            # Helper to measure branch size (number of atoms)
+            def get_branch_size(start_idx, parent_idx):
+                visited = {parent_idx, start_idx}
+                queue = [start_idx]
+                count = 0
+                while queue:
+                    curr = queue.pop(0)
+                    count += 1
+                    for nb in mol.GetAtomWithIdx(curr).GetNeighbors():
+                        ni = nb.GetIdx()
+                        if ni not in visited:
+                            visited.add(ni)
+                            queue.append(ni)
+                return count
+    
+            # 1. Identify neighbors
+            neighbors = [nb.GetIdx() for nb in N_atom.GetNeighbors()]
+            
+            # 2. Find the neighbor with the smallest branch (the "Shortest Alkyl Group")
+            best_nb = None
+            min_size = float('inf')
+            
+            for nb_idx in neighbors:
+                size = get_branch_size(nb_idx, N_idx)
+                if size < min_size:
+                    min_size = size
+                    best_nb = nb_idx
+            
+            if best_nb is None: 
+                # Fallback if something is wrong with the structure
+                return Npos, np.array([0.0, 0.0, 1.0])
+    
+            # 3. Define Vector: From Methyl (best_nb) -> Nitrogen (Npos)
+            #    - The code aligns 'v_anchor' with the surface normal (pointing OUT).
+            #    - By defining the vector as Methyl->N, we ensure N is "above" the Methyl.
+            #    - Result: The Methyl group points "straight DOWN" (into the nanocrystal).
+            v_anchor = Npos - coords[best_nb]
+            
+            return Npos, unit(v_anchor)
+    
+class QuaternaryAmmoniumFG(FGDef):
+    """
+    Quaternary ammonium (permanent cation).
+    Matches Nitrogen with 4 bonds and +1 charge: [NX4+]
+    """
+    # Pattern matches a Nitrogen with 4 bonds and a +1 formal charge
+    neutral_pattern = Chem.MolFromSmarts("[#7X4+]") 
+
+    def __init__(self):
+        super().__init__("quat_ammonium", "cation", "[#7X4+]")
+
+    def to_ionic(self, mol: Chem.Mol, match: Tuple[int, ...]) -> Chem.Mol:
+        # It is already ionic (permanently charged). Do nothing.
+        return mol
+
+    def to_neutral(self, mol: Chem.Mol, match: Tuple[int, ...]) -> Chem.Mol:
+        # It cannot be neutralized (permanent charge). Return as is.
+        return mol
+
+    def anchor_center_and_vector(self, mol: Chem.Mol, match: Tuple[int, ...]) -> Tuple[np.ndarray, np.ndarray]:
         coords = rdconf_to_numpy(mol)
         N_idx = match[0]
         Npos  = coords[N_idx]
+        
+        # Get all neighbors (which are the Carbon tails)
         neighs = [nb.GetIdx() for nb in mol.GetAtomWithIdx(N_idx).GetNeighbors()]
+        
+        # 1. Calculate a local plane to help alignment (standard procedure in this file)
         if len(neighs) >= 2:
-            v1 = coords[neighs[0]] - Npos; v2 = coords[neighs[1]] - Npos
+            v1 = coords[neighs[0]] - Npos
+            v2 = coords[neighs[1]] - Npos
             n_plane = unit(np.cross(v1, v2))
         else:
             n_plane = np.array([0.0, 0.0, 1.0])
-        carbons = [i for i in neighs if mol.GetAtomWithIdx(i).GetAtomicNum() == 6]
-        if carbons:
-            ccent = coords[carbons].mean(axis=0)
+            
+        # 2. Calculate the vector pointing from N towards the bulk of the molecule
+        if neighs:
+            ccent = coords[neighs].mean(axis=0)
             v_tail = ccent - Npos
         else:
             v_tail = np.array([1.0, 0.0, 0.0])
+            
+        # 3. Project to ensure the vector is robust
         v_proj = project_onto_plane(v_tail, n_plane)
         v_anchor = v_tail if np.linalg.norm(v_proj) < 1e-8 else v_proj
+        
         return Npos, unit(v_anchor)
+
 
 
 class HydrogenHalideFG(FGDef):
@@ -654,6 +729,7 @@ def get_fg_registry() -> List[FGDef]:
         HydrogenHalideFG(),
         HydrogenSulfideFG(),
         AmmoniumFG(),
+        QuaternaryAmmoniumFG(),
     ]
 
 def detect_fg_matches_neutral(mol: Chem.Mol, role: str, registry: Optional[List[FGDef]] = None
@@ -684,6 +760,9 @@ def detect_fg_matches_neutral(mol: Chem.Mol, role: str, registry: Optional[List[
             patt = HydrogenSulfideFG.neutral_pattern
         elif isinstance(fg, AmmoniumFG):
             patt = AmmoniumFG.neutral_pattern
+        elif isinstance(fg, QuaternaryAmmoniumFG):
+            patt = QuaternaryAmmoniumFG.neutral_pattern
+        # ----------------------
         if patt is None:
             continue
         for match in mol.GetSubstructMatches(patt):
